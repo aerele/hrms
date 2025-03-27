@@ -3,6 +3,7 @@
 
 
 import datetime
+import json
 
 import frappe
 from frappe import _
@@ -185,8 +186,12 @@ def get_skill_wise_average_rating(interview: str) -> list[dict]:
 
 
 @frappe.whitelist()
-def update_job_applicant_status(status: str, job_applicant: str):
+def update_job_applicant_status(status: str | None = None, job_applicant: str | None = None, args=None):
 	try:
+		if not job_applicant and not status and args:
+			args = json.loads(args)
+			status = args["status"]
+			job_applicant = args["job_applicant"]
 		if not job_applicant:
 			frappe.throw(_("Please specify the job applicant to be updated."))
 
