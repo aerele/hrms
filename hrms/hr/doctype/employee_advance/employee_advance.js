@@ -156,8 +156,18 @@ frappe.ui.form.on("Employee Advance", {
 	},
 
 	employee: function (frm) {
+		console.log("Called");
+
 		if (frm.doc.employee) {
 			frm.trigger("update_fields_label");
+			frappe.db.get_value(
+				"Employee",
+				{ name: frm.doc.employee },
+				"employee_advance_account",
+				(r) => {
+					frm.set_value("advance_account", r.employee_advance_account);
+				},
+			);
 		}
 	},
 

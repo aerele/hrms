@@ -148,7 +148,6 @@
    "fieldtype": "Column Break"
   },
   {
-   "fetch_from": "employee.employee_advance_account",
    "fetch_if_empty": 1,
    "fieldname": "advance_account",
    "fieldtype": "Link",
