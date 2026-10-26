@@ -180,7 +180,7 @@ frappe.ui.form.on("Payroll Entry", {
 
 	add_bank_entry_button: function (frm) {
 		frm.call("has_bank_entries").then((r) => {
-			if (!r.message.has_bank_entries) {
+			if (r.message.has_unpaid_salary) {
 				frm.add_custom_button(__("Make Bank Entry"), function () {
 					make_bank_entry(frm);
 				}).addClass("btn-primary");

@@ -21,6 +21,7 @@ from hrms.payroll.doctype.payroll_entry.payroll_entry import (
 	get_end_date,
 	get_start_end_dates,
 	set_match_conditions,
+	submit_salary_slips_for_employees,
 )
 from hrms.payroll.doctype.salary_component.test_salary_component import create_salary_component
 from hrms.payroll.doctype.salary_slip.salary_slip_loan_utils import if_lending_app_installed
@@ -36,7 +37,7 @@ from hrms.payroll.doctype.salary_structure.test_salary_structure import (
 	make_salary_structure,
 )
 from hrms.tests.test_utils import create_department
-from hrms.tests.utils import HRMSTestSuite
+from hrms.tests.utils import HRMSTestSuite, make_user
 from hrms.utils import get_date_range
 
 
@@ -1478,6 +1479,166 @@ class TestPayrollEntry(HRMSTestSuite):
 		self.assertIn("'A'", query_sql)
 		self.assertNotIn("Employee Grade", query_sql)
 		self.assertNotIn("Unknown Doctype", query_sql)
+
+	def test_bank_entry_pays_only_later_accrued_slips(self):
+		for employee_wise in (0, 1):
+			with (
+				self.subTest(employee_wise=employee_wise),
+				self.change_settings(
+					"Payroll Settings", {"process_payroll_accounting_entry_based_on_employee": employee_wise}
+				),
+			):
+				payroll, slips, user = self.make_payroll_for_payment_test(suffix=str(employee_wise))
+				with self.set_user(user):
+					self.accrue_payment_test_slip(payroll, slips[0])
+					first_payment = payroll.make_bank_entry()
+					self.submit_payment_test_entry(first_payment)
+					self.accrue_payment_test_slip(payroll, slips[1])
+					payment_status = payroll.has_bank_entries()
+					self.assertTrue(payment_status["has_bank_entries"])
+					self.assertTrue(payment_status["has_unpaid_salary"])
+					second_payment = payroll.make_bank_entry()
+					self.assertEqual(second_payment.total_debit, slips[1].base_net_pay)
+					if employee_wise:
+						parties = {row.party for row in second_payment.accounts if row.party}
+						self.assertEqual(parties, {slips[1].employee})
+					self.assertIsNone(payroll.make_bank_entry())
+					self.assertFalse(payroll.has_bank_entries()["has_unpaid_salary"])
+
+	def test_bank_entry_reserves_drafts_and_restores_cancelled_payments(self):
+		payroll, slips, user = self.make_payroll_for_payment_test()
+		with self.set_user(user):
+			self.accrue_payment_test_slip(payroll, slips[0])
+			self.assertTrue(payroll.has_bank_entries()["has_unpaid_salary"])
+			payment = payroll.make_bank_entry()
+			self.assertIsNone(payroll.make_bank_entry())
+			self.assertFalse(payroll.has_bank_entries()["has_unpaid_salary"])
+			self.submit_payment_test_entry(payment)
+			payment.cancel()
+			self.assertFalse(payroll.has_bank_entries()["has_bank_entries"])
+			self.assertTrue(payroll.has_bank_entries()["has_unpaid_salary"])
+			replacement = payroll.make_bank_entry()
+			self.assertEqual(replacement.total_debit, slips[0].base_net_pay)
+
+	def test_bank_entry_deducts_partial_payments_in_payroll_currency(self):
+		for employee_wise in (0, 1):
+			with (
+				self.subTest(employee_wise=employee_wise),
+				self.change_settings(
+					"Payroll Settings", {"process_payroll_accounting_entry_based_on_employee": employee_wise}
+				),
+			):
+				payroll, slips, user = self.make_payroll_for_payment_test(
+					suffix=str(employee_wise), currency="USD", exchange_rate=70
+				)
+				with self.set_user(user):
+					self.accrue_payment_test_slip(payroll, slips[0])
+					payment = payroll.make_bank_entry()
+					for row in payment.accounts:
+						row.debit_in_account_currency /= 2
+						row.credit_in_account_currency /= 2
+					payment.save()
+					self.submit_payment_test_entry(payment)
+					self.assertTrue(payroll.has_bank_entries()["has_unpaid_salary"])
+					remaining = payroll.make_bank_entry()
+					self.assertEqual(remaining.total_debit, slips[0].base_net_pay - payment.total_debit)
+					self.assertIsNone(payroll.make_bank_entry())
+
+	def test_bank_entry_excludes_unaccrued_slips(self):
+		payroll, slips, user = self.make_payroll_for_payment_test()
+		with self.set_user(user):
+			slips[0].submit()
+			self.assertFalse(payroll.has_bank_entries()["has_unpaid_salary"])
+			self.assertIsNone(payroll.make_bank_entry())
+
+	def test_later_bank_entry_keeps_withheld_payments_separate(self):
+		for employee_wise in (0, 1):
+			with (
+				self.subTest(employee_wise=employee_wise),
+				self.change_settings(
+					"Payroll Settings", {"process_payroll_accounting_entry_based_on_employee": employee_wise}
+				),
+			):
+				payroll, slips, user = self.make_payroll_for_payment_test(
+					suffix=str(employee_wise), withhold_first_employee=True
+				)
+				with self.set_user(user):
+					self.accrue_payment_test_slip(payroll, slips[0])
+					withheld_payment = payroll.make_bank_entry(for_withheld_salaries=True)
+					self.assertIsNone(payroll.make_bank_entry(for_withheld_salaries=True))
+					self.accrue_payment_test_slip(payroll, slips[1])
+					self.assertTrue(payroll.has_bank_entries()["has_unpaid_salary"])
+					regular_payment = payroll.make_bank_entry()
+					self.assertEqual(regular_payment.total_debit, slips[1].base_net_pay)
+					self.submit_payment_test_entry(withheld_payment)
+					self.assertIsNone(payroll.make_bank_entry())
+					withheld_payment.cancel()
+					self.assertIsNone(payroll.make_bank_entry())
+					replacement = payroll.make_bank_entry(for_withheld_salaries=True)
+					self.assertEqual(replacement.total_debit, slips[0].base_net_pay)
+
+	def make_payroll_for_payment_test(
+		self, suffix="default", currency="INR", exchange_rate=1, withhold_first_employee=False
+	):
+		department = create_department(f"{self._testMethodName} {suffix}")
+		employees = [
+			make_employee(
+				f"payment-balance-{index}-{suffix}@example.com",
+				company="_Test Company",
+				department=department,
+			)
+			for index in (1, 2)
+		]
+		structure = make_salary_structure(
+			f"_Test Payment Balance {suffix}",
+			"Monthly",
+			employees[0],
+			company="_Test Company",
+			currency=currency,
+		)
+		create_salary_structure_assignment(
+			employees[1], structure.name, company="_Test Company", currency=currency
+		)
+		dates = get_start_end_dates("Monthly", nowdate())
+		if withhold_first_employee:
+			frappe.get_doc(
+				doctype="Salary Withholding",
+				employee=employees[0],
+				from_date=dates.start_date,
+				number_of_withholding_cycles=1,
+			).insert().submit()
+		payroll = get_payroll_entry(
+			start_date=dates.start_date,
+			end_date=dates.end_date,
+			payable_account="_Test Payroll Payable - _TC",
+			currency=currency,
+			exchange_rate=exchange_rate,
+			department=department,
+			company="_Test Company",
+			payment_account="Cash - _TC",
+			cost_center="Main - _TC",
+		)
+		user = make_user("payroll-payment-manager@example.com")
+		frappe.get_doc("User", user).add_roles("Accounts Manager")
+		with self.set_user(user):
+			payroll.submit()
+		slips = [
+			frappe.get_doc("Salary Slip", {"payroll_entry": payroll.name, "employee": e}) for e in employees
+		]
+		return payroll, slips, user
+
+	def accrue_payment_test_slip(self, payroll, slip):
+		submit_salary_slips_for_employees(
+			payroll, [(slip.name, slip.salary_structure)], publish_progress=False
+		)
+		slip.reload()
+		self.assertEqual(slip.docstatus, 1)
+		self.assertTrue(slip.journal_entry)
+
+	def submit_payment_test_entry(self, payment):
+		payment.cheque_no = "TEST-PAYROLL-PAYMENT"
+		payment.cheque_date = nowdate()
+		payment.submit()
 
 
 def get_payroll_entry(**args):

@@ -10,7 +10,7 @@ import frappe
 from frappe import _
 from frappe.desk.reportview import get_match_cond
 from frappe.model.document import Document
-from frappe.query_builder.functions import Coalesce, Count
+from frappe.query_builder.functions import Coalesce, Count, Sum
 from frappe.utils import (
 	DATE_FORMAT,
 	add_days,
@@ -1067,6 +1067,7 @@ class PayrollEntry(Document):
 
 	@frappe.whitelist()
 	def has_bank_entries(self) -> dict[str, bool]:
+		self.check_permission("read")
 		je = frappe.qb.DocType("Journal Entry")
 		jea = frappe.qb.DocType("Journal Entry Account")
 
@@ -1077,6 +1078,7 @@ class PayrollEntry(Document):
 			.select(je.name)
 			.where(
 				((je.voucher_type == "Bank Entry") | (je.voucher_type == "Cash Entry"))
+				& (je.docstatus < 2)
 				& (jea.reference_name == self.name)
 				& (jea.reference_type == "Payroll Entry")
 			)
@@ -1084,14 +1086,31 @@ class PayrollEntry(Document):
 
 		return {
 			"has_bank_entries": bool(bank_entries),
-			"has_bank_entries_for_withheld_salaries": not any(
-				employee.is_salary_withheld for employee in self.employees
-			),
+			"has_unpaid_salary": self.get_salary_payment_amounts()[0] > 0,
+			"has_bank_entries_for_withheld_salaries": self.get_salary_payment_amounts(True)[0] <= 0,
 		}
 
 	@frappe.whitelist(methods=["POST"])
 	def make_bank_entry(self, for_withheld_salaries: bool = False) -> Document | None:
 		self.check_permission("write")
+		frappe.db.get_value("Payroll Entry", self.name, "name", for_update=True)
+		salary_slip_total, salary_details, employee_wise_accounting_enabled = self.get_salary_payment_amounts(
+			for_withheld_salaries
+		)
+
+		bank_entry = None
+		if salary_slip_total > 0:
+			remark = "withheld salaries" if for_withheld_salaries else "salaries"
+			bank_entry = self.set_accounting_entries_for_bank_entry(
+				salary_slip_total, remark, employee_wise_accounting_enabled
+			)
+
+			if for_withheld_salaries:
+				link_bank_entry_in_salary_withholdings(salary_details, bank_entry.name)
+
+		return bank_entry
+
+	def get_salary_payment_amounts(self, for_withheld_salaries=False):
 		self.employee_based_payroll_payable_entries = {}
 		employee_wise_accounting_enabled = frappe.db.get_single_value(
 			"Payroll Settings", "process_payroll_accounting_entry_based_on_employee"
@@ -1122,27 +1141,92 @@ class PayrollEntry(Document):
 		total_loan_repayment = self.process_loan_repayments_for_bank_entry(salary_details) or 0
 		salary_slip_total -= total_loan_repayment
 
-		bank_entry = None
+		if not for_withheld_salaries:
+			payments = self.get_salary_bank_payments()
+			if employee_wise_accounting_enabled:
+				if payments.get(None):
+					frappe.throw(
+						_(
+							"Existing payroll payments have no employee references. Reconcile them before making an employee-wise payment."
+						)
+					)
+				for employee, details in self.employee_based_payroll_payable_entries.items():
+					details["paid_amount"] = payments.get(employee, 0)
+			else:
+				salary_slip_total -= sum(payments.values())
 
-		if salary_slip_total > 0:
-			remark = "withheld salaries" if for_withheld_salaries else "salaries"
-			bank_entry = self.set_accounting_entries_for_bank_entry(
-				salary_slip_total, remark, employee_wise_accounting_enabled
+		if employee_wise_accounting_enabled:
+			salary_slip_total = sum(
+				max(
+					0,
+					flt(details.get("earnings"))
+					- flt(details.get("deductions"))
+					- flt(details.get("total_loan_repayment"))
+					- flt(details.get("paid_amount")),
+				)
+				for details in self.employee_based_payroll_payable_entries.values()
 			)
 
-			if for_withheld_salaries:
-				link_bank_entry_in_salary_withholdings(salary_details, bank_entry.name)
+		precision = frappe.get_precision("Journal Entry Account", "debit_in_account_currency")
+		return flt(salary_slip_total, precision), salary_details, employee_wise_accounting_enabled
 
-		return bank_entry
+	def get_salary_bank_payments(self):
+		# Draft entries reserve the balance too; withheld salaries have their own payment flow.
+		JournalEntry = frappe.qb.DocType("Journal Entry")
+		Account = frappe.qb.DocType("Journal Entry Account")
+		Cycle = frappe.qb.DocType("Salary Withholding Cycle")
+		withheld_payments = (
+			frappe.qb.from_(Cycle)
+			.select(Cycle.journal_entry)
+			.where(Cycle.journal_entry.isnotnull() & (Cycle.journal_entry != ""))
+		)
+		payments = (
+			frappe.qb.from_(Account)
+			.join(JournalEntry)
+			.on(Account.parent == JournalEntry.name)
+			.select(
+				Account.party,
+				Sum(Account.debit_in_account_currency - Account.credit_in_account_currency).as_("amount"),
+			)
+			.where(
+				(Account.reference_type == self.doctype)
+				& (Account.reference_name == self.name)
+				& (Account.account == self.payroll_payable_account)
+				& (JournalEntry.company == self.company)
+				& (JournalEntry.docstatus < 2)
+				& JournalEntry.voucher_type.isin(["Bank Entry", "Cash Entry"])
+				& JournalEntry.name.notin(withheld_payments)
+			)
+			.groupby(Account.party)
+		).run(as_dict=True)
+		company_currency = erpnext.get_company_currency(self.company)
+		# Compare payments in payable-account currency with salary amounts in payroll currency.
+		_, conversion_rate = self.get_amount_and_exchange_rate_for_journal_entry(
+			self.payroll_payable_account, 1, company_currency, []
+		)
+		amounts = {}
+		for row in payments:
+			employee = row.party or None
+			amounts[employee] = amounts.get(employee, 0) + flt(row.amount) / conversion_rate
+		return amounts
 
 	def get_salary_slip_details(self, for_withheld_salaries=False):
 		SalarySlip = frappe.qb.DocType("Salary Slip")
 		SalaryDetail = frappe.qb.DocType("Salary Detail")
+		Accrual = frappe.qb.DocType("Journal Entry")
+		Cycle = frappe.qb.DocType("Salary Withholding Cycle")
+		Payment = frappe.qb.DocType("Journal Entry").as_("withholding_payment")
 
 		query = (
 			frappe.qb.from_(SalarySlip)
 			.join(SalaryDetail)
 			.on(SalarySlip.name == SalaryDetail.parent)
+			.join(Accrual)
+			.on(SalarySlip.journal_entry == Accrual.name)
+			.left_join(Cycle)
+			.on(SalarySlip.salary_withholding_cycle == Cycle.name)
+			.left_join(Payment)
+			.on(Cycle.journal_entry == Payment.name)
 			.select(
 				SalarySlip.name,
 				SalarySlip.employee,
@@ -1154,6 +1238,8 @@ class PayrollEntry(Document):
 			)
 			.where(
 				(SalarySlip.docstatus == 1)
+				& (Accrual.docstatus == 1)
+				& (Payment.name.isnull() | (Payment.docstatus == 2))
 				& (SalarySlip.start_date >= self.start_date)
 				& (SalarySlip.end_date <= self.end_date)
 				& (SalarySlip.payroll_entry == self.name)
@@ -1226,9 +1312,10 @@ class PayrollEntry(Document):
 					(employee_details.get("earnings", 0) or 0)
 					- (employee_details.get("deductions", 0) or 0)
 					- (employee_details.get("total_loan_repayment", 0) or 0)
+					- (employee_details.get("paid_amount", 0) or 0)
 				)
 
-				if not je_payment_amount:
+				if je_payment_amount <= 0:
 					continue
 
 				exchange_rate, amount = self.get_amount_and_exchange_rate_for_journal_entry(
